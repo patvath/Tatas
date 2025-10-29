@@ -1,5 +1,5 @@
-# app.py — Single-player BallDontLie Streamlit app with auth fallbacks
-# -------------------------------------------------------------------
+# app.py — Single-player BallDontLie Streamlit app with robust auth + route fallbacks
+# -----------------------------------------------------------------------------------
 # 🔑 PASTE YOUR KEY HERE (keep quotes)
 API_KEY_DEFAULT = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
 
@@ -11,6 +11,7 @@ from typing import List, Dict, Optional, Tuple
 import requests
 import pandas as pd
 import streamlit as st
+from urllib.parse import urlencode
 
 st.set_page_config(page_title="NBA Projections — Single Player (BALLDONTLIE)",
                    page_icon="🏀", layout="wide")
@@ -54,30 +55,40 @@ if "last_status" not in st.session_state:
 if "last_url" not in st.session_state:
     st.session_state.last_url = None
 
-def _headers(style: str) -> Dict[str,str]:
-    """style = 'raw' or 'bearer'"""
-    if style == "bearer":
-        return {"Authorization": f"Bearer {API_KEY}"}
-    return {"Authorization": API_KEY}
+AUTH_STYLES = [
+    ("auth_raw",     lambda k: {"Authorization": k},                    False),
+    ("auth_bearer",  lambda k: {"Authorization": f"Bearer {k}"},        False),
+    ("x_api_key",    lambda k: {"X-API-KEY": k},                        False),
+    ("x_api_key_lc", lambda k: {"x-api-key": k},                        False),
+    ("apikey_hdr",   lambda k: {"apikey": k},                           False),
+    ("api_key_qs",   lambda k: {},                                      True),  # sends ?api_key=...
+]
 
 # --------------------------- HTTP helper ---------------------------------
 def http_get(full_url: str, params: dict = None, timeout: int = 20, retries: int = 2):
     """
-    Tries raw-token header first; on 401 retries with Bearer.
-    Handles 429 with small backoff. Returns (json, None) or (None, (status, preview)).
+    Tries multiple auth header names (and qs param) until one works.
+    Handles 429 with brief backoff. Returns (json, None) or (None, (status, preview)).
     """
     if not API_KEY:
         st.error("No API key detected. Paste it into API_KEY_DEFAULT at the top (or sidebar).")
         st.stop()
     params = params or {}
 
-    # Try raw first
-    for style in ["raw", "bearer"]:
-        headers = _headers(style)
+    for style_name, header_fn, use_qs in AUTH_STYLES:
+        headers = header_fn(API_KEY)
+        attempt_params = dict(params)
+        url = full_url
+
+        if use_qs:
+            # append api_key in query string
+            delim = "&" if ("?" in url) else "?"
+            url = f"{url}{delim}{urlencode({'api_key': API_KEY})}"
+
         for attempt in range(retries + 1):
-            r = requests.get(full_url, headers=headers, params=params, timeout=timeout)
+            r = requests.get(url, headers=headers, params=attempt_params, timeout=timeout)
             st.session_state.last_status = r.status_code
-            st.session_state.last_url = full_url
+            st.session_state.last_url = url
 
             # 429 backoff
             if r.status_code == 429 and attempt < retries:
@@ -85,23 +96,24 @@ def http_get(full_url: str, params: dict = None, timeout: int = 20, retries: int
                 time.sleep(wait)
                 continue
 
-            # 401: if raw failed, try bearer next; if bearer failed too, bubble error
             if r.status_code == 401:
-                break  # move to next style (or exit if already bearer)
+                # try next auth style
+                break
 
             if r.status_code != 200:
                 preview = (r.text or "")[:400]
                 return None, (r.status_code, preview)
 
             try:
-                st.session_state.auth_style = style
+                st.session_state.auth_style = style_name
                 return r.json(), None
             except ValueError:
                 preview = (r.text or "")[:400]
                 return None, (999, f"Non-JSON response: {preview}")
-        # if we got here due to 401 on this style, loop continues to alternate style
 
-    return None, (401, "Unauthorized after trying both raw and Bearer Authorization headers.")
+        # move to next style
+
+    return None, (401, "Unauthorized after trying raw, Bearer, X-API-KEY, x-api-key, apikey headers, and api_key query param.")
 
 # ----------------------------- API helpers -------------------------------
 @st.cache_data(ttl=600)
@@ -211,7 +223,7 @@ def r2(v):
 
 # ---------------------------------- UI -----------------------------------
 st.title("NBA Projections — Single Player (BALLDONTLIE)")
-st.caption("Paste your API key at the very top. The app tries both raw and Bearer auth automatically and falls back across routes.")
+st.caption("Paste your API key at the very top. The app tries multiple header names and the api_key query param automatically.")
 
 show_diag = st.sidebar.checkbox("Show diagnostics", value=True)
 st.sidebar.code(f"Key length: {len(API_KEY) if API_KEY else 0}\nAuth style used: {st.session_state.auth_style}\nLast status: {st.session_state.last_status}\nLast URL: {st.session_state.last_url}")
