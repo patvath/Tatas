@@ -1,5 +1,5 @@
-# app.py — Single-player BallDontLie Streamlit app with route fallbacks
-# --------------------------------------------------------------------
+# app.py — Single-player BallDontLie Streamlit app with auth fallbacks
+# -------------------------------------------------------------------
 # 🔑 PASTE YOUR KEY HERE (keep quotes)
 API_KEY_DEFAULT = "7f4db7a9-c34e-478d-a799-fef77b9d1f78"
 
@@ -24,7 +24,7 @@ def resolve_api_key() -> str:
     sidebar_k = st.sidebar.text_input("BALLDONTLIE API Key (optional)", value="", type="password")
     if sidebar_k.strip():
         return sidebar_k.strip()
-    # optional secrets/env (not required since you want manual)
+    # optional secrets/env
     try:
         s1 = st.secrets.get("BALLDONTLIE_API_KEY", "")
         s2 = st.secrets.get("api", {}).get("api_key", "") if hasattr(st, "secrets") else ""
@@ -39,7 +39,6 @@ def resolve_api_key() -> str:
     return ""
 
 API_KEY = resolve_api_key()
-HEADERS = {"Authorization": API_KEY} if API_KEY else {}
 
 # Preferred and fallback bases in order
 BASES = [
@@ -47,29 +46,62 @@ BASES = [
     "https://api.balldontlie.io/v1",
 ]
 
+# global diagnostics
+if "auth_style" not in st.session_state:
+    st.session_state.auth_style = "unknown"
+if "last_status" not in st.session_state:
+    st.session_state.last_status = None
+if "last_url" not in st.session_state:
+    st.session_state.last_url = None
+
+def _headers(style: str) -> Dict[str,str]:
+    """style = 'raw' or 'bearer'"""
+    if style == "bearer":
+        return {"Authorization": f"Bearer {API_KEY}"}
+    return {"Authorization": API_KEY}
+
 # --------------------------- HTTP helper ---------------------------------
 def http_get(full_url: str, params: dict = None, timeout: int = 20, retries: int = 2):
+    """
+    Tries raw-token header first; on 401 retries with Bearer.
+    Handles 429 with small backoff. Returns (json, None) or (None, (status, preview)).
+    """
     if not API_KEY:
         st.error("No API key detected. Paste it into API_KEY_DEFAULT at the top (or sidebar).")
         st.stop()
     params = params or {}
-    last_err = None
-    for attempt in range(retries + 1):
-        r = requests.get(full_url, headers=HEADERS, params=params, timeout=timeout)
-        if r.status_code == 429 and attempt < retries:
-            # polite backoff
-            wait = float(r.headers.get("Retry-After", 1 + attempt))
-            time.sleep(wait)
-            continue
-        if r.status_code != 200:
-            last_err = (r.status_code, (r.text or "")[:400])
-            break
-        try:
-            return r.json(), None
-        except ValueError as e:
-            last_err = (999, f"Non-JSON response: {(r.text or '')[:400]}")
-            break
-    return None, last_err
+
+    # Try raw first
+    for style in ["raw", "bearer"]:
+        headers = _headers(style)
+        for attempt in range(retries + 1):
+            r = requests.get(full_url, headers=headers, params=params, timeout=timeout)
+            st.session_state.last_status = r.status_code
+            st.session_state.last_url = full_url
+
+            # 429 backoff
+            if r.status_code == 429 and attempt < retries:
+                wait = float(r.headers.get("Retry-After", 1 + attempt))
+                time.sleep(wait)
+                continue
+
+            # 401: if raw failed, try bearer next; if bearer failed too, bubble error
+            if r.status_code == 401:
+                break  # move to next style (or exit if already bearer)
+
+            if r.status_code != 200:
+                preview = (r.text or "")[:400]
+                return None, (r.status_code, preview)
+
+            try:
+                st.session_state.auth_style = style
+                return r.json(), None
+            except ValueError:
+                preview = (r.text or "")[:400]
+                return None, (999, f"Non-JSON response: {preview}")
+        # if we got here due to 401 on this style, loop continues to alternate style
+
+    return None, (401, "Unauthorized after trying both raw and Bearer Authorization headers.")
 
 # ----------------------------- API helpers -------------------------------
 @st.cache_data(ttl=600)
@@ -84,37 +116,28 @@ def search_player_any_route(name: str) -> Tuple[pd.DataFrame, str, dict | None]:
     last_err = None
     for url, params in routes:
         payload, err = http_get(url, params)
-        if payload and isinstance(payload, dict) and "data" in payload and payload["data"]:
-            df = pd.json_normalize(payload["data"])
-            return df, f"{url}", None
-        if err:
-            last_err = {"url": url, "status_or_code": err[0], "preview": err[1]}
-        else:
-            # no error, just empty data
-            last_err = {"url": url, "status_or_code": 200, "preview": "empty data[]"}
+        if payload and isinstance(payload, dict) and payload.get("data"):
+            return pd.json_normalize(payload["data"]), url, None
+        last_err = {"url": url, "err": err or (200, "empty data[]")}
     return pd.DataFrame(), "", last_err
 
 @st.cache_data(ttl=600)
 def get_season_averages_any(player_id: int, season: int) -> Tuple[dict, str, dict | None]:
-    """Try nba/v1 season_averages/general then legacy v1 season_averages."""
-    # Try modern first
     url1 = BASES[0] + "/season_averages/general"
     params1 = {"season": season, "type": "base", "season_type": "regular", "player_ids[]": player_id}
     payload, err = http_get(url1, params1)
-    if payload and isinstance(payload, dict) and payload.get("data"):
+    if payload and payload.get("data"):
         return payload["data"][0], url1, None
-    # Fallback legacy
+
     url2 = BASES[1] + "/season_averages"
     params2 = {"season": season, "player_ids[]": player_id}
     payload2, err2 = http_get(url2, params2)
-    if payload2 and isinstance(payload2, dict) and payload2.get("data"):
+    if payload2 and payload2.get("data"):
         return payload2["data"][0], url2, None
     return {}, url2, {"first": {"url": url1, "err": err}, "second": {"url": url2, "err": err2}}
 
 @st.cache_data(ttl=600)
 def get_recent_stats_any(player_id: int, start_date: str, end_date: str) -> Tuple[List[dict], str, dict | None]:
-    """Try nba/v1/stats then legacy v1/stats. Batch dates in chunks."""
-    # Build date list
     d0 = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
     d1 = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
     dates = []
@@ -126,7 +149,7 @@ def get_recent_stats_any(player_id: int, start_date: str, end_date: str) -> Tupl
     rows: List[dict] = []
     route_used = ""
     last_err = None
-    for base in BASES:  # try nba/v1 then v1
+    for base in BASES:
         ok = True
         tmp_rows: List[dict] = []
         for i in range(0, len(dates), 10):
@@ -134,7 +157,6 @@ def get_recent_stats_any(player_id: int, start_date: str, end_date: str) -> Tupl
             params = [("player_ids[]", player_id)]
             for d in chunk:
                 params.append(("dates[]", d))
-            # convert to dict (works fine for these endpoints)
             payload, err = http_get(base + "/stats", dict(params))
             if not payload or "data" not in payload:
                 ok = False
@@ -189,10 +211,10 @@ def r2(v):
 
 # ---------------------------------- UI -----------------------------------
 st.title("NBA Projections — Single Player (BALLDONTLIE)")
-st.caption("Paste your API key at the very top. This app only searches one player per query and tries multiple routes for compatibility.")
+st.caption("Paste your API key at the very top. The app tries both raw and Bearer auth automatically and falls back across routes.")
 
-show_diag = st.sidebar.checkbox("Show diagnostics", value=False)
-st.sidebar.code(f"Key length: {len(API_KEY) if API_KEY else 0}")
+show_diag = st.sidebar.checkbox("Show diagnostics", value=True)
+st.sidebar.code(f"Key length: {len(API_KEY) if API_KEY else 0}\nAuth style used: {st.session_state.auth_style}\nLast status: {st.session_state.last_status}\nLast URL: {st.session_state.last_url}")
 
 with st.form("player_form"):
     player_query = st.text_input("Player name", placeholder="e.g., Stephen Curry")
@@ -205,7 +227,7 @@ with st.form("player_form"):
 
 if submitted:
     if not API_KEY:
-        st.error("No API key found. Paste into API_KEY_DEFAULT at the top or use sidebar.")
+        st.error("No API key found. Paste into API_KEY_DEFAULT at the top or use the sidebar.")
         st.stop()
     if not player_query.strip():
         st.warning("Enter a player name.")
@@ -216,7 +238,7 @@ if submitted:
     if show_diag:
         st.sidebar.write("Search route used:", used_route or "none")
         if search_err:
-            st.sidebar.write("Search route error:", search_err)
+            st.sidebar.write("Search route err:", search_err)
 
     if df_players.empty:
         st.error("No player found from any supported route. Try a different spelling.")
@@ -230,7 +252,7 @@ if submitted:
     st.subheader(f"{selected['full_name']}  (ID {pid})")
     st.write(f"Team: {selected.get('team.full_name', 'N/A')} — Pos: {selected.get('position') or 'N/A'}")
 
-    # ---- Season averages (modern then legacy) ----
+    # ---- Season averages ----
     season_num = dt.date.today().year
     srow, season_route, season_err = get_season_averages_any(pid, season_num)
     season_avg = {
@@ -241,19 +263,19 @@ if submitted:
         "MIN": srow.get("min"),
     }
     if show_diag:
-        st.sidebar.write("Season route used:", season_route or "none")
+        st.sidebar.write("Season route:", season_route or "none")
         if season_err:
-            st.sidebar.write("Season route error:", season_err)
+            st.sidebar.write("Season err:", season_err)
 
-    # ---- Recent stats (modern then legacy) ----
+    # ---- Recent stats ----
     start_date = (dt.date.today() - dt.timedelta(days=recent_days)).strftime("%Y-%m-%d")
     end_date = dt.date.today().strftime("%Y-%m-%d")
     rec_rows, stats_route, stats_err = get_recent_stats_any(pid, start_date, end_date)
     recent_avg = compute_recent_avgs(rec_rows) or {}
     if show_diag:
-        st.sidebar.write("Stats route used:", stats_route or "none")
+        st.sidebar.write("Stats route:", stats_route or "none")
         if stats_err:
-            st.sidebar.write("Stats route error:", stats_err)
+            st.sidebar.write("Stats err:", stats_err)
 
     # ---- Projection ----
     proj = blend_projection(season_avg, recent_avg, season_weight, 1 - season_weight)
@@ -283,4 +305,4 @@ if submitted:
         "Blend": f"{season_weight:.2f} season + {1-season_weight:.2f} recent"
     }]))
 else:
-    st.info("Enter a player name and click **Get Projection**. If a route is blocked, enable **Show diagnostics** in the sidebar.")
+    st.info("Enter a player name and click **Get Projection**. Use **Show diagnostics** if auth/route issues persist.")
